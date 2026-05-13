@@ -1,0 +1,42 @@
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# PyInstaller outputs
+build/
+dist/
+*.manifest
+*.log
+
+# Local runtime / test artifacts
+recv*
+received*
+test.bin
+*.tmp
+
+# Generated archives and executables
+*.exe
+*.zip
+*.7z
+*.rar
+
+# Vendor driver binaries and import libraries.
+# Keep these out of public repositories unless the vendor license allows redistribution.
+ControlCANx64/**/*.dll
+ControlCANx64/**/*.lib
+ControlCANx64/**/*.exe
+library/**/*.dll
+library/**/*.lib
+library/**/*.exe
