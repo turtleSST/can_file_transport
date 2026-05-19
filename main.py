@@ -10,7 +10,6 @@ from controlcan_bus import (
     ControlCANBus,
     VCI_USBCAN2,
     build_channel_configs,
-    bitrate_to_timing,
     find_library_root,
 )
 
@@ -36,6 +35,8 @@ RX_WAIT_TIMEOUT_SECONDS = 0.005
 WRITE_BUFFER_SIZE = 64 * 1024
 CAN_STANDARD_8B_FRAME_BITS_NO_STUFF = 111
 CAN_STANDARD_8B_FRAME_BITS_WITH_STUFF_ESTIMATE = 130
+PROGRESS_STEP_PERCENT = 10
+SHOW_PERFORMANCE_COUNTERS = False
 
 BITRATE_OPTIONS = {
     "1": 500000,
@@ -259,12 +260,7 @@ def ask_can_bitrate(default: int = DEFAULT_CAN_BITRATE) -> int:
 
 def init_can_bus(channel: int, bitrate: int):
     library_root = find_library_root()
-    timing0, timing1 = bitrate_to_timing(bitrate)
-    print(
-        f"Initializing ControlCAN: VCI_USBCAN2, channel {channel}, bitrate {bitrate}..."
-    )
-    print(f"CAN timing: Timing0=0x{timing0:02X}, Timing1=0x{timing1:02X}")
-    print(f"Driver root: {library_root}")
+    print(f"Initializing ControlCAN: channel {channel}, bitrate {bitrate}...")
 
     try:
         bus = ControlCANBus(
@@ -334,6 +330,12 @@ def total_data_frames(file_size: int) -> int:
     return math.ceil(file_size / DATA_PAYLOAD_SIZE)
 
 
+def progress_step_frames(total_frames: int) -> int:
+    if total_frames <= 0:
+        return 0
+    return max(1, math.ceil(total_frames * PROGRESS_STEP_PERCENT / 100))
+
+
 def send_mode():
     file_path = normalize_input_path(
         input("Enter the file path to send, e.g. test.bin: ")
@@ -369,6 +371,8 @@ def send_mode():
 
         sent_frames = 0
         sequence = 0
+        next_progress = progress_step_frames(frame_count)
+        progress_step = next_progress
         read_size = DATA_PAYLOAD_SIZE * TX_BATCH_FRAMES
         with open(file_path, "rb") as file_obj:
             while True:
@@ -400,13 +404,15 @@ def send_mode():
                 sent_frames += len(frames)
 
                 if frame_count and (
-                    sent_frames == frame_count or sent_frames % 5000 == 0
+                    sent_frames >= next_progress or sent_frames == frame_count
                 ):
                     percent = (sent_frames / frame_count) * 100
                     print(
                         f"Sent {sent_frames}/{frame_count} CAN data frames "
                         f"({percent:.1f}%)"
                     )
+                    while next_progress <= sent_frames:
+                        next_progress += progress_step
 
         end_frames = [build_end_frame(frame_count)]
         submit_start = time.perf_counter()
@@ -420,13 +426,14 @@ def send_mode():
 
         print("\nSend completed.")
         print(f"Elapsed: {cost:.2f} s | Average speed: {speed:.2f} KB/s\n")
-        print_send_performance(
-            app_perf,
-            bus.performance_snapshot(),
-            cost,
-            file_size,
-            bitrate,
-        )
+        if SHOW_PERFORMANCE_COUNTERS:
+            print_send_performance(
+                app_perf,
+                bus.performance_snapshot(),
+                cost,
+                file_size,
+                bitrate,
+            )
     except Exception as exc:
         print(f"\nError during send: {exc}\n")
     finally:
@@ -457,6 +464,8 @@ def recv_mode():
         start_time = None
         transfer_done = False
         write_buffer = bytearray()
+        next_progress = 0
+        progress_step = 0
         app_perf = new_recv_perf_counters()
         bus.reset_performance_counters()
 
@@ -489,6 +498,8 @@ def recv_mode():
                                 f"file size: {expected_size} bytes, "
                                 f"CAN data frames: {expected_frames}"
                             )
+                            progress_step = progress_step_frames(expected_frames)
+                            next_progress = progress_step
                             if expected_size == 0:
                                 return
                         continue
@@ -536,14 +547,16 @@ def recv_mode():
 
                     expected_sequence += 1
                     if expected_frames and (
-                        expected_sequence == expected_frames
-                        or expected_sequence % 5000 == 0
+                        expected_sequence >= next_progress
+                        or expected_sequence == expected_frames
                     ):
                         percent = (expected_sequence / expected_frames) * 100
                         print(
                             f"Received {expected_sequence}/{expected_frames} "
                             f"CAN data frames ({percent:.1f}%)"
                         )
+                        while next_progress <= expected_sequence:
+                            next_progress += progress_step
 
                     if received_size >= expected_size and expected_sequence >= expected_frames:
                         timed_write_buffer(file_obj, write_buffer, app_perf)
@@ -561,13 +574,14 @@ def recv_mode():
                 f"File size: {received_size} bytes | "
                 f"Elapsed: {cost:.2f} s | Average speed: {speed:.2f} KB/s\n"
             )
-            print_recv_performance(
-                app_perf,
-                bus.performance_snapshot(),
-                cost,
-                received_size,
-                bitrate,
-            )
+            if SHOW_PERFORMANCE_COUNTERS:
+                print_recv_performance(
+                    app_perf,
+                    bus.performance_snapshot(),
+                    cost,
+                    received_size,
+                    bitrate,
+                )
     except KeyboardInterrupt:
         print("\nReceive cancelled by user.\n")
     except Exception as exc:
