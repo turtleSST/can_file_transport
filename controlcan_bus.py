@@ -90,6 +90,30 @@ CONTROL_CAN_ERROR_FLAGS = {
 }
 
 
+CONTROL_CAN_PERF_DEFAULTS = {
+    "tx_dll_calls": 0,
+    "tx_dll_frames_requested": 0,
+    "tx_dll_frames_accepted": 0,
+    "tx_partial_results": 0,
+    "tx_zero_results": 0,
+    "tx_error_results": 0,
+    "tx_driver_seconds": 0.0,
+    "tx_retry_sleep_seconds": 0.0,
+    "rx_dll_calls": 0,
+    "rx_requested_capacity": 0,
+    "rx_frames_received": 0,
+    "rx_frames_returned": 0,
+    "rx_empty_results": 0,
+    "rx_error_results": 0,
+    "rx_driver_seconds": 0.0,
+    "rx_buffer_allocations": 0,
+}
+
+
+def new_controlcan_perf_counters() -> dict[str, int | float]:
+    return dict(CONTROL_CAN_PERF_DEFAULTS)
+
+
 class VCI_CAN_OBJ(ctypes.Structure):
     _fields_ = [
         ("ID", ctypes.c_uint32),
@@ -408,6 +432,8 @@ class ControlCANBus(can.BusABC):
         self._driver_root: Path | None = None
         self._original_cwd: Path | None = None
         self._cwd_restored = False
+        self._perf_counters = new_controlcan_perf_counters()
+        self._receive_buffers: dict[int, tuple[int, object]] = {}
 
         try:
             self._driver_root = prepare_runtime_paths(self._library_root)
@@ -444,6 +470,22 @@ class ControlCANBus(can.BusABC):
         if self._dll is None:
             raise CanError("ControlCAN DLL not loaded")
         return self._dll
+
+    def reset_performance_counters(self) -> None:
+        self._perf_counters = new_controlcan_perf_counters()
+
+    def performance_snapshot(self) -> dict[str, int | float]:
+        return dict(self._perf_counters)
+
+    def _receive_buffer(self, batch_size: int) -> object:
+        cached = self._receive_buffers.get(batch_size)
+        if cached is not None:
+            return cached[1]
+
+        frame_array = (VCI_CAN_OBJ * batch_size)()
+        self._receive_buffers[batch_size] = (batch_size, frame_array)
+        self._perf_counters["rx_buffer_allocations"] += 1
+        return frame_array
 
     def _config_for_channel(self, channel: int) -> dict:
         if self._channel_configs and channel < len(self._channel_configs):
@@ -514,6 +556,7 @@ class ControlCANBus(can.BusABC):
 
         while True:
             attempts += 1
+            call_start = time.perf_counter()
             result = dll.VCI_Transmit(
                 self._device_type,
                 self._device_index,
@@ -521,9 +564,18 @@ class ControlCANBus(can.BusABC):
                 frame_array,
                 1,
             )
+            call_elapsed = time.perf_counter() - call_start
+            self._perf_counters["tx_dll_calls"] += 1
+            self._perf_counters["tx_dll_frames_requested"] += 1
+            self._perf_counters["tx_driver_seconds"] += call_elapsed
             last_result = int(result)
             if result == 1:
+                self._perf_counters["tx_dll_frames_accepted"] += 1
                 return
+            if result == 0:
+                self._perf_counters["tx_zero_results"] += 1
+            else:
+                self._perf_counters["tx_error_results"] += 1
             if time.monotonic() >= deadline:
                 diagnostics = self._transmit_diagnostics(channel)
                 raise CanError(
@@ -531,7 +583,11 @@ class ControlCANBus(can.BusABC):
                     f"channel={channel}, arbitration_id=0x{msg.arbitration_id:X}, "
                     f"result={last_result}, attempts={attempts}. {diagnostics}"
                 )
+            sleep_start = time.perf_counter()
             time.sleep(0.001)
+            self._perf_counters["tx_retry_sleep_seconds"] += (
+                time.perf_counter() - sleep_start
+            )
 
     def _read_can_status(self, channel: int) -> VCI_CAN_STATUS | None:
         dll = self._require_dll()
@@ -632,6 +688,7 @@ class ControlCANBus(can.BusABC):
 
             deadline = time.monotonic() + max(0.0, float(timeout))
             while True:
+                call_start = time.perf_counter()
                 result = dll.VCI_Transmit(
                     self._device_type,
                     self._device_index,
@@ -639,10 +696,23 @@ class ControlCANBus(can.BusABC):
                     frame_array,
                     len(chunk),
                 )
+                call_elapsed = time.perf_counter() - call_start
+                self._perf_counters["tx_dll_calls"] += 1
+                self._perf_counters["tx_dll_frames_requested"] += len(chunk)
+                self._perf_counters["tx_driver_seconds"] += call_elapsed
                 sent = int(result)
                 if 0 < sent != 0xFFFFFFFF:
-                    offset += min(sent, len(chunk))
+                    accepted = min(sent, len(chunk))
+                    self._perf_counters["tx_dll_frames_accepted"] += accepted
+                    if accepted < len(chunk):
+                        self._perf_counters["tx_partial_results"] += 1
+                    offset += accepted
                     break
+
+                if sent == 0:
+                    self._perf_counters["tx_zero_results"] += 1
+                else:
+                    self._perf_counters["tx_error_results"] += 1
 
                 if time.monotonic() >= deadline:
                     diagnostics = self._transmit_diagnostics(target_channel)
@@ -651,7 +721,11 @@ class ControlCANBus(can.BusABC):
                         f"channel={target_channel}, sent={offset}/{total}, "
                         f"result={sent}. {diagnostics}"
                     )
+                sleep_start = time.perf_counter()
                 time.sleep(0)
+                self._perf_counters["tx_retry_sleep_seconds"] += (
+                    time.perf_counter() - sleep_start
+                )
 
     def receive_raw_frames(
         self,
@@ -667,8 +741,9 @@ class ControlCANBus(can.BusABC):
 
         batch_size = max(1, int(max_frames))
         wait_ms = -1 if timeout is None else max(0, int(timeout * 1000))
-        frame_array = (VCI_CAN_OBJ * batch_size)()
+        frame_array = self._receive_buffer(batch_size)
 
+        call_start = time.perf_counter()
         count = dll.VCI_Receive(
             self._device_type,
             self._device_index,
@@ -677,20 +752,31 @@ class ControlCANBus(can.BusABC):
             batch_size,
             wait_ms,
         )
+        call_elapsed = time.perf_counter() - call_start
+        self._perf_counters["rx_dll_calls"] += 1
+        self._perf_counters["rx_requested_capacity"] += batch_size
+        self._perf_counters["rx_driver_seconds"] += call_elapsed
         count = int(count)
         if count == 0xFFFFFFFF:
+            self._perf_counters["rx_error_results"] += 1
             raise CanError(
                 f"VCI_Receive failed: channel={target_channel}. "
                 f"{self._transmit_diagnostics(target_channel)}"
             )
 
+        received = min(count, batch_size)
+        self._perf_counters["rx_frames_received"] += received
+        if received == 0:
+            self._perf_counters["rx_empty_results"] += 1
+
         result: list[tuple[int, bytes]] = []
-        for frame_index in range(min(count, batch_size)):
+        for frame_index in range(received):
             frame = frame_array[frame_index]
             if frame.RemoteFlag:
                 continue
             payload_len = min(int(frame.DataLen), 8)
             result.append((int(frame.ID), bytes(frame.Data[:payload_len])))
+        self._perf_counters["rx_frames_returned"] += len(result)
         return result
 
     def _read_messages(self, timeout: Optional[float]) -> None:

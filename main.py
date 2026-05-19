@@ -10,13 +10,14 @@ from controlcan_bus import (
     ControlCANBus,
     VCI_USBCAN2,
     build_channel_configs,
+    bitrate_to_timing,
     find_library_root,
 )
 
 
 CAN_DEVICE_TYPE = VCI_USBCAN2
 DEFAULT_CAN_CHANNEL = 0
-DEFAULT_CAN_BITRATE = 500000
+DEFAULT_CAN_BITRATE = 1000000
 
 META_ID = 0x700
 DATA_ID_BASE = 0x701
@@ -31,12 +32,192 @@ END_FRAME = struct.Struct("<4sI")
 DATA_PAYLOAD_SIZE = 8
 TX_BATCH_FRAMES = 512
 RX_BATCH_FRAMES = 1024
+RX_WAIT_TIMEOUT_SECONDS = 0.005
 WRITE_BUFFER_SIZE = 64 * 1024
+CAN_STANDARD_8B_FRAME_BITS_NO_STUFF = 111
+CAN_STANDARD_8B_FRAME_BITS_WITH_STUFF_ESTIMATE = 130
 
 BITRATE_OPTIONS = {
     "1": 500000,
     "2": 1000000,
 }
+
+
+def new_send_perf_counters() -> dict[str, int | float]:
+    return {
+        "file_read_calls": 0,
+        "file_read_bytes": 0,
+        "file_read_seconds": 0.0,
+        "build_calls": 0,
+        "build_frames": 0,
+        "build_seconds": 0.0,
+        "tx_submit_calls": 0,
+        "tx_submit_frames": 0,
+        "tx_submit_seconds": 0.0,
+    }
+
+
+def new_recv_perf_counters() -> dict[str, int | float]:
+    return {
+        "rx_fetch_calls": 0,
+        "rx_fetch_frames": 0,
+        "rx_empty_batches": 0,
+        "rx_fetch_seconds": 0.0,
+        "rx_process_seconds": 0.0,
+        "file_write_calls": 0,
+        "file_write_bytes": 0,
+        "file_write_seconds": 0.0,
+        "file_truncate_calls": 0,
+        "file_truncate_seconds": 0.0,
+    }
+
+
+def counter_value(counters: dict[str, int | float], key: str) -> float:
+    return float(counters.get(key, 0))
+
+
+def counter_int(counters: dict[str, int | float], key: str) -> int:
+    return int(counters.get(key, 0))
+
+
+def format_rate(bytes_count: int, seconds: float) -> str:
+    if seconds <= 0:
+        return "0.00 KB/s"
+    return f"{(bytes_count / 1024) / seconds:.2f} KB/s"
+
+
+def format_frames_per_second(frame_count: int, seconds: float) -> str:
+    if seconds <= 0:
+        return "0.00 frames/s"
+    return f"{frame_count / seconds:.2f} frames/s"
+
+
+def format_bus_load(frame_count: int, seconds: float, bitrate: int) -> str:
+    if seconds <= 0 or bitrate <= 0:
+        return "0.0%-0.0%"
+    frame_rate = frame_count / seconds
+    low = (frame_rate * CAN_STANDARD_8B_FRAME_BITS_NO_STUFF / bitrate) * 100
+    high = (frame_rate * CAN_STANDARD_8B_FRAME_BITS_WITH_STUFF_ESTIMATE / bitrate) * 100
+    return f"{low:.1f}%-{high:.1f}%"
+
+
+def print_send_performance(
+    app_perf: dict[str, int | float],
+    driver_perf: dict[str, int | float],
+    elapsed_seconds: float,
+    file_size: int,
+    bitrate: int,
+) -> None:
+    tx_submit_seconds = counter_value(app_perf, "tx_submit_seconds")
+    driver_seconds = counter_value(driver_perf, "tx_driver_seconds")
+    retry_sleep_seconds = counter_value(driver_perf, "tx_retry_sleep_seconds")
+    wrapper_seconds = max(0.0, tx_submit_seconds - driver_seconds - retry_sleep_seconds)
+
+    print("\nPerformance counters (send):")
+    print(
+        "  App: "
+        f"read={counter_int(app_perf, 'file_read_calls')} calls/"
+        f"{counter_int(app_perf, 'file_read_bytes')} bytes/"
+        f"{counter_value(app_perf, 'file_read_seconds'):.6f}s, "
+        f"build={counter_int(app_perf, 'build_frames')} frames/"
+        f"{counter_value(app_perf, 'build_seconds'):.6f}s, "
+        f"submit={counter_int(app_perf, 'tx_submit_calls')} calls/"
+        f"{counter_int(app_perf, 'tx_submit_frames')} frames/"
+        f"{tx_submit_seconds:.6f}s"
+    )
+    print(
+        "  ControlCAN TX: "
+        f"dll_calls={counter_int(driver_perf, 'tx_dll_calls')}, "
+        f"requested={counter_int(driver_perf, 'tx_dll_frames_requested')}, "
+        f"accepted={counter_int(driver_perf, 'tx_dll_frames_accepted')}, "
+        f"partial={counter_int(driver_perf, 'tx_partial_results')}, "
+        f"zero={counter_int(driver_perf, 'tx_zero_results')}, "
+        f"errors={counter_int(driver_perf, 'tx_error_results')}"
+    )
+    print(
+        "  Time split: "
+        f"elapsed={elapsed_seconds:.6f}s ({format_rate(file_size, elapsed_seconds)}), "
+        f"data_frame_rate={format_frames_per_second(counter_int(app_perf, 'build_frames'), elapsed_seconds)}, "
+        f"bus_load_est={format_bus_load(counter_int(app_perf, 'build_frames'), elapsed_seconds, bitrate)}@{bitrate}bps, "
+        f"dll={driver_seconds:.6f}s, "
+        f"retry_sleep={retry_sleep_seconds:.6f}s, "
+        f"wrapper_est={wrapper_seconds:.6f}s"
+    )
+
+
+def print_recv_performance(
+    app_perf: dict[str, int | float],
+    driver_perf: dict[str, int | float],
+    elapsed_seconds: float,
+    received_size: int,
+    bitrate: int,
+) -> None:
+    rx_fetch_seconds = counter_value(app_perf, "rx_fetch_seconds")
+    driver_seconds = counter_value(driver_perf, "rx_driver_seconds")
+    wrapper_seconds = max(0.0, rx_fetch_seconds - driver_seconds)
+
+    print("\nPerformance counters (receive):")
+    print(
+        "  App: "
+        f"fetch={counter_int(app_perf, 'rx_fetch_calls')} calls/"
+        f"{counter_int(app_perf, 'rx_fetch_frames')} frames/"
+        f"{rx_fetch_seconds:.6f}s, "
+        f"empty_batches={counter_int(app_perf, 'rx_empty_batches')}, "
+        f"process={counter_value(app_perf, 'rx_process_seconds'):.6f}s"
+    )
+    print(
+        "  File: "
+        f"writes={counter_int(app_perf, 'file_write_calls')} calls/"
+        f"{counter_int(app_perf, 'file_write_bytes')} bytes/"
+        f"{counter_value(app_perf, 'file_write_seconds'):.6f}s, "
+        f"truncate={counter_int(app_perf, 'file_truncate_calls')} calls/"
+        f"{counter_value(app_perf, 'file_truncate_seconds'):.6f}s"
+    )
+    print(
+        "  ControlCAN RX: "
+        f"dll_calls={counter_int(driver_perf, 'rx_dll_calls')}, "
+        f"capacity={counter_int(driver_perf, 'rx_requested_capacity')}, "
+        f"received={counter_int(driver_perf, 'rx_frames_received')}, "
+        f"returned={counter_int(driver_perf, 'rx_frames_returned')}, "
+        f"empty={counter_int(driver_perf, 'rx_empty_results')}, "
+        f"errors={counter_int(driver_perf, 'rx_error_results')}, "
+        f"buffer_allocations={counter_int(driver_perf, 'rx_buffer_allocations')}"
+    )
+    print(
+        "  Time split: "
+        f"elapsed={elapsed_seconds:.6f}s ({format_rate(received_size, elapsed_seconds)}), "
+        f"data_frame_rate={format_frames_per_second(counter_int(app_perf, 'rx_fetch_frames'), elapsed_seconds)}, "
+        f"bus_load_est={format_bus_load(counter_int(app_perf, 'rx_fetch_frames'), elapsed_seconds, bitrate)}@{bitrate}bps, "
+        f"dll={driver_seconds:.6f}s, "
+        f"wrapper_est={wrapper_seconds:.6f}s"
+    )
+
+
+def timed_write_buffer(
+    file_obj,
+    write_buffer: bytearray,
+    perf: dict[str, int | float],
+) -> None:
+    if not write_buffer:
+        return
+    bytes_to_write = len(write_buffer)
+    write_start = time.perf_counter()
+    file_obj.write(write_buffer)
+    perf["file_write_seconds"] += time.perf_counter() - write_start
+    perf["file_write_calls"] += 1
+    perf["file_write_bytes"] += bytes_to_write
+    write_buffer.clear()
+
+
+def timed_truncate(
+    file_obj,
+    size: int,
+    perf: dict[str, int | float],
+) -> None:
+    truncate_start = time.perf_counter()
+    file_obj.truncate(size)
+    perf["file_truncate_seconds"] += time.perf_counter() - truncate_start
+    perf["file_truncate_calls"] += 1
 
 
 def normalize_input_path(value: str) -> str:
@@ -78,9 +259,11 @@ def ask_can_bitrate(default: int = DEFAULT_CAN_BITRATE) -> int:
 
 def init_can_bus(channel: int, bitrate: int):
     library_root = find_library_root()
+    timing0, timing1 = bitrate_to_timing(bitrate)
     print(
         f"Initializing ControlCAN: VCI_USBCAN2, channel {channel}, bitrate {bitrate}..."
     )
+    print(f"CAN timing: Timing0=0x{timing0:02X}, Timing1=0x{timing1:02X}")
     print(f"Driver root: {library_root}")
 
     try:
@@ -174,24 +357,44 @@ def send_mode():
             f"(size: {file_size} bytes, CAN data frames: {frame_count})"
         )
 
+        app_perf = new_send_perf_counters()
+        bus.reset_performance_counters()
         start_time = time.time()
-        bus.transmit_raw_frames(build_meta_frames(file_size, frame_count), channel=channel)
+        meta_frames = build_meta_frames(file_size, frame_count)
+        submit_start = time.perf_counter()
+        bus.transmit_raw_frames(meta_frames, channel=channel)
+        app_perf["tx_submit_seconds"] += time.perf_counter() - submit_start
+        app_perf["tx_submit_calls"] += 1
+        app_perf["tx_submit_frames"] += len(meta_frames)
 
         sent_frames = 0
         sequence = 0
         read_size = DATA_PAYLOAD_SIZE * TX_BATCH_FRAMES
         with open(file_path, "rb") as file_obj:
             while True:
+                read_start = time.perf_counter()
                 chunk = file_obj.read(read_size)
+                app_perf["file_read_seconds"] += time.perf_counter() - read_start
+                app_perf["file_read_calls"] += 1
                 if not chunk:
                     break
+                app_perf["file_read_bytes"] += len(chunk)
 
+                build_start = time.perf_counter()
                 frames = build_data_frames(chunk, sequence)
+                app_perf["build_seconds"] += time.perf_counter() - build_start
+                app_perf["build_calls"] += 1
+                app_perf["build_frames"] += len(frames)
+
+                submit_start = time.perf_counter()
                 bus.transmit_raw_frames(
                     frames,
                     channel=channel,
                     max_batch=TX_BATCH_FRAMES,
                 )
+                app_perf["tx_submit_seconds"] += time.perf_counter() - submit_start
+                app_perf["tx_submit_calls"] += 1
+                app_perf["tx_submit_frames"] += len(frames)
 
                 sequence += len(frames)
                 sent_frames += len(frames)
@@ -205,13 +408,25 @@ def send_mode():
                         f"({percent:.1f}%)"
                     )
 
-        bus.transmit_raw_frames([build_end_frame(frame_count)], channel=channel)
+        end_frames = [build_end_frame(frame_count)]
+        submit_start = time.perf_counter()
+        bus.transmit_raw_frames(end_frames, channel=channel)
+        app_perf["tx_submit_seconds"] += time.perf_counter() - submit_start
+        app_perf["tx_submit_calls"] += 1
+        app_perf["tx_submit_frames"] += len(end_frames)
 
         cost = time.time() - start_time
         speed = (file_size / 1024) / cost if cost > 0 else 0
 
         print("\nSend completed.")
         print(f"Elapsed: {cost:.2f} s | Average speed: {speed:.2f} KB/s\n")
+        print_send_performance(
+            app_perf,
+            bus.performance_snapshot(),
+            cost,
+            file_size,
+            bitrate,
+        )
     except Exception as exc:
         print(f"\nError during send: {exc}\n")
     finally:
@@ -242,14 +457,25 @@ def recv_mode():
         start_time = None
         transfer_done = False
         write_buffer = bytearray()
+        app_perf = new_recv_perf_counters()
+        bus.reset_performance_counters()
 
         with open(save_path, "wb") as file_obj:
             while not transfer_done:
-                for arbitration_id, payload in bus.receive_raw_frames(
+                fetch_start = time.perf_counter()
+                batch = bus.receive_raw_frames(
                     channel=channel,
                     max_frames=RX_BATCH_FRAMES,
-                    timeout=0,
-                ):
+                    timeout=RX_WAIT_TIMEOUT_SECONDS,
+                )
+                app_perf["rx_fetch_seconds"] += time.perf_counter() - fetch_start
+                app_perf["rx_fetch_calls"] += 1
+                app_perf["rx_fetch_frames"] += len(batch)
+                if not batch:
+                    app_perf["rx_empty_batches"] += 1
+
+                process_start = time.perf_counter()
+                for arbitration_id, payload in batch:
                     if arbitration_id == META_ID:
                         if meta_received:
                             continue
@@ -279,10 +505,8 @@ def recv_mode():
                                 f"got {end_frame_count}, expected {expected_frames}"
                             )
                         if received_size >= expected_size:
-                            if write_buffer:
-                                file_obj.write(write_buffer)
-                                write_buffer.clear()
-                            file_obj.truncate(expected_size)
+                            timed_write_buffer(file_obj, write_buffer, app_perf)
+                            timed_truncate(file_obj, expected_size, app_perf)
                             transfer_done = True
                             break
                         continue
@@ -308,8 +532,7 @@ def recv_mode():
                         write_buffer.extend(payload[:remaining])
                         received_size += min(len(payload), remaining)
                         if len(write_buffer) >= WRITE_BUFFER_SIZE:
-                            file_obj.write(write_buffer)
-                            write_buffer.clear()
+                            timed_write_buffer(file_obj, write_buffer, app_perf)
 
                     expected_sequence += 1
                     if expected_frames and (
@@ -323,12 +546,11 @@ def recv_mode():
                         )
 
                     if received_size >= expected_size and expected_sequence >= expected_frames:
-                        if write_buffer:
-                            file_obj.write(write_buffer)
-                            write_buffer.clear()
-                        file_obj.truncate(expected_size)
+                        timed_write_buffer(file_obj, write_buffer, app_perf)
+                        timed_truncate(file_obj, expected_size, app_perf)
                         transfer_done = True
                         break
+                app_perf["rx_process_seconds"] += time.perf_counter() - process_start
 
         if transfer_done:
             cost = time.time() - start_time if start_time else 0
@@ -338,6 +560,13 @@ def recv_mode():
             print(
                 f"File size: {received_size} bytes | "
                 f"Elapsed: {cost:.2f} s | Average speed: {speed:.2f} KB/s\n"
+            )
+            print_recv_performance(
+                app_perf,
+                bus.performance_snapshot(),
+                cost,
+                received_size,
+                bitrate,
             )
     except KeyboardInterrupt:
         print("\nReceive cancelled by user.\n")
